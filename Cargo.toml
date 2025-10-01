@@ -1,0 +1,82 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+embassy-executor = { version = "0.9.1", features = [
+    "nightly",
+    "arch-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+] }
+embassy-rp = { version = "0.8.0", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "rp2040",
+] }
+embassy-time = { version = "0.5.0", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+embassy-sync = { version = "0.7.2" }
+embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
+
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+
+cortex-m = { version = "0.7.6", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+portable-atomic = { version = "1.11.1", features = ["critical-section"] }
+pio-proc = "0.3.0"
+pio = "0.3.0"
+fixed = "1.29.0"
+fixed-macro = "1.2.0"
+static_cell = "2.1.1"
+mavlink = { version = "0.15", default-features = false, features = [
+    "common",
+    "embedded",
+] }
+rtt-target = "0.6.1"
+
+[profile.dev]
+debug = 2
+debug-assertions = true
+opt-level = 0
+overflow-checks = true
+
+[profile.release]
+codegen-units = 1
+debug = 0
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 'z'
+overflow-checks = false
+
+# do not optimize proc-macro crates = faster builds from scratch
+[profile.dev.build-override]
+codegen-units = 8
+debug = false
+debug-assertions = false
+opt-level = 0
+overflow-checks = false
+
+[profile.release.build-override]
+codegen-units = 8
+debug = false
+debug-assertions = false
+opt-level = 0
+overflow-checks = false
+
+[[bin]]
+name = "picoscope-rs"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
