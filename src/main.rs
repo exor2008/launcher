@@ -2,7 +2,9 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use defmt::info;
+use core::sync::atomic::Ordering;
+
+use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::UART1;
@@ -11,24 +13,30 @@ use embassy_time::Timer;
 use embedded_io_async::Write;
 use mavlink;
 use mavlink::ardupilotmega::{
-    COMMAND_ACK_DATA, COMMAND_LONG_DATA, HEARTBEAT_DATA, MavMessage, RC_CHANNELS_DATA,
-    SERVO_OUTPUT_RAW_DATA,
+    COMMAND_ACK_DATA, COMMAND_LONG_DATA, HEARTBEAT_DATA, MavAutopilot, MavCmd, MavMessage,
+    MavModeFlag, MavResult, MavState, MavType, RC_CHANNELS_DATA,
 };
 use mavlink::{MAVLinkV2MessageRaw, MavlinkVersion, MessageData, read_v2_raw_message_async};
-// use rtt_target::{rprintln, rtt_init_print};
+use portable_atomic::AtomicBool;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
 });
+
+pub static IS_NEW_HB: AtomicBool = AtomicBool::new(true);
+
 const BUF_SIZE: usize = 1024 * 10;
+const ATEMPTS: usize = 100;
+const WAIT_FC_START: u64 = 3; // sec
+const HB_SEND_INTERVAL: u64 = 1; // sec
+const HB_WATCHDOG_INTERVAL: u64 = 2; // sec
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // rtt_init_print!();
-
     let p = embassy_rp::init(Default::default());
 
+    // UART
     let (tx_pin, rx_pin, uart) = (p.PIN_4, p.PIN_5, p.UART1);
 
     static TX_BUF: StaticCell<[u8; BUF_SIZE]> = StaticCell::new();
@@ -38,12 +46,20 @@ async fn main(spawner: Spawner) {
     let mut config = Config::default();
 
     config.baudrate = 57600;
-    let uart = BufferedUart::new(uart, tx_pin, rx_pin, Irqs, tx_buf, rx_buf, config);
-    let (tx, mut rx) = uart.split();
+    let mut uart = BufferedUart::new(uart, tx_pin, rx_pin, Irqs, tx_buf, rx_buf, config);
 
+    // Wait for the FC to start
+    // Timer::after_secs(WAIT_FC_START).await;
+
+    // Send first heartbeat
+    info!("Sending initial Heartbeat");
+    write_mav(&mut uart, &heartbeat_data()).await;
+
+    // Wait for the first Heartbeat
     info!("Waiting for the heartbeat...");
+    let mut atempts = ATEMPTS;
     loop {
-        let raw = read_v2_raw_message_async::<MavMessage>(&mut rx)
+        let raw = read_v2_raw_message_async::<MavMessage>(&mut uart)
             .await
             .unwrap();
 
@@ -51,11 +67,60 @@ async fn main(spawner: Spawner) {
             info!("Got heartbeat, starting.");
             break;
         }
+
+        atempts -= 1;
+
+        if atempts == 0 {
+            error!("No heartbeat received after {} atempts", ATEMPTS);
+            panic!("No heartbeat received after {} atempts", ATEMPTS);
+        }
     }
 
-    // Spawn Tx loop
-    spawner.spawn(tx_task(tx)).unwrap();
+    // Send RC request
+    info!("Requesting the RC...");
+    write_mav(&mut uart, &rc_request_data()).await;
 
+    // Wait for the ACK
+    atempts = ATEMPTS;
+    loop {
+        let raw = read_v2_raw_message_async::<MavMessage>(&mut uart)
+            .await
+            .unwrap();
+
+        if raw.message_id() == COMMAND_ACK_DATA::ID {
+            let ack = COMMAND_ACK_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
+            if ack.command as u32 == MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL as u32 {
+                match ack.result {
+                    MavResult::MAV_RESULT_ACCEPTED => {
+                        info!("RC request accepted");
+                        break;
+                    }
+                    _ => {
+                        error!("RC request denied, error code: {}", ack.result as u8);
+                        panic!("RC request denied, error code: {}", ack.result as u8);
+                    }
+                }
+            }
+        }
+    }
+
+    atempts -= 1;
+
+    if atempts == 0 {
+        error!("No heartbeat received after {} atteempts", ATEMPTS);
+        panic!("No heartbeat received after {} atteempts", ATEMPTS);
+    }
+
+    // Split uart
+    let (tx, mut rx) = uart.split();
+
+    // Spawn Heartbeat Watchdog
+    spawner.spawn(heartbeat_watchdog_task()).unwrap();
+
+    // Spawn Heartbeat Sender
+    spawner.spawn(send_heartbeat_task(tx)).unwrap();
+
+    info!("Receiving RC data...");
     loop {
         let raw = read_v2_raw_message_async::<MavMessage>(&mut rx)
             .await
@@ -63,25 +128,12 @@ async fn main(spawner: Spawner) {
 
         match raw.message_id() {
             HEARTBEAT_DATA::ID => {
-                // info!("HEARTBEAT");
-                // let hb = HEARTBEAT_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
-                // rprintln!("heartbeat: {:?}", hb);
-            }
-            SERVO_OUTPUT_RAW_DATA::ID => {
-                let servo =
-                    SERVO_OUTPUT_RAW_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
-                info!("SERVO port: {}", servo.port);
+                IS_NEW_HB.store(true, Ordering::Relaxed);
             }
             RC_CHANNELS_DATA::ID => {
+                // Send to a State machine
                 let rc = RC_CHANNELS_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
                 info!("RC9: {}", rc.chan9_raw);
-            }
-            COMMAND_ACK_DATA::ID => {
-                let ack = COMMAND_ACK_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
-                info!(
-                    "ACK Cmd: {}, Result: {}",
-                    ack.command as u16, ack.result as u8
-                );
             }
             _ => info!("Message id: {}", raw.message_id()),
         }
@@ -89,22 +141,37 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-pub async fn tx_task(mut tx: BufferedUartTx) {
-    // Requesting the servo data
-    info!("Sending Servo request");
-    write_mav(&mut tx, &servo_data()).await;
+async fn send_heartbeat_task(mut tx: BufferedUartTx) {
+    info!("Start sending heartbeats to a FC...");
 
     loop {
         write_mav(&mut tx, &heartbeat_data()).await;
 
-        // Delay for 1 second
-        Timer::after_millis(1000).await;
+        Timer::after_secs(HB_SEND_INTERVAL).await;
     }
 }
 
-async fn write_mav<M>(tx: &mut BufferedUartTx, msg: &M)
+#[embassy_executor::task]
+async fn heartbeat_watchdog_task() {
+    info!("Start watching heartbeats from a FC...");
+
+    loop {
+        let is_new = IS_NEW_HB.load(Ordering::Relaxed);
+        match is_new {
+            true => IS_NEW_HB.store(false, Ordering::Relaxed),
+            false => {
+                error!("No heartbeat from the Flight Controller");
+                panic!("No heartbeat from the Flight Controller");
+            }
+        }
+        Timer::after_secs(HB_WATCHDOG_INTERVAL).await;
+    }
+}
+
+async fn write_mav<M, W>(tx: &mut W, msg: &M)
 where
     M: MessageData,
+    W: Write,
 {
     let mut raw = MAVLinkV2MessageRaw::new();
     raw.serialize_message_data(header(), msg);
@@ -122,19 +189,19 @@ fn header() -> mavlink::MavHeader {
 fn heartbeat_data() -> HEARTBEAT_DATA {
     HEARTBEAT_DATA {
         custom_mode: 0,
-        mavtype: mavlink::ardupilotmega::MavType::MAV_TYPE_SERVO,
-        autopilot: mavlink::ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
-        base_mode: mavlink::ardupilotmega::MavModeFlag::empty(),
-        system_status: mavlink::ardupilotmega::MavState::MAV_STATE_STANDBY,
+        mavtype: MavType::MAV_TYPE_SERVO,
+        autopilot: MavAutopilot::MAV_AUTOPILOT_INVALID,
+        base_mode: MavModeFlag::empty(),
+        system_status: MavState::MAV_STATE_STANDBY,
         mavlink_version: 0x3,
     }
 }
 
-fn servo_data() -> COMMAND_LONG_DATA {
+fn rc_request_data() -> COMMAND_LONG_DATA {
     COMMAND_LONG_DATA {
         target_system: 1,
         target_component: 1,
-        command: mavlink::ardupilotmega::MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
+        command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
         // param1: ACTUATOR_OUTPUT_STATUS_DATA::ID as f32,
         // param1: mavlink::common::BATTERY_STATUS_DATA::ID as f32,
         // param1: SERVO_OUTPUT_RAW_DATA::ID as f32,
