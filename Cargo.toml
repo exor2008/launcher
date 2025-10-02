@@ -39,8 +39,9 @@ fixed = "1.29.0"
 fixed-macro = "1.2.0"
 static_cell = "2.1.1"
 mavlink = { version = "0.15", default-features = false, features = [
-    "common",
     "embedded",
+    "common",
+    "ardupilotmega",
 ] }
 rtt-target = "0.6.1"
 
