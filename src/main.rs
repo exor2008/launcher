@@ -9,8 +9,11 @@ use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::UART1;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartTx, Config};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::Timer;
 use embedded_io_async::Write;
+use launcher::{FireControl, FireDetector};
 use mavlink;
 use mavlink::ardupilotmega::{
     COMMAND_ACK_DATA, COMMAND_LONG_DATA, HEARTBEAT_DATA, MavAutopilot, MavCmd, MavMessage,
@@ -24,13 +27,15 @@ bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
 });
 
-pub static IS_NEW_HB: AtomicBool = AtomicBool::new(true);
-
 const BUF_SIZE: usize = 1024 * 10;
 const ATEMPTS: usize = 100;
 const WAIT_FC_START: u64 = 3; // sec
 const HB_SEND_INTERVAL: u64 = 1; // sec
 const HB_WATCHDOG_INTERVAL: u64 = 2; // sec
+const LAUNCHERS: usize = 8; // sec
+
+pub static IS_NEW_HB: AtomicBool = AtomicBool::new(true);
+static FIRE_CHANNEL: Channel<ThreadModeRawMutex, bool, LAUNCHERS> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -120,6 +125,12 @@ async fn main(spawner: Spawner) {
     // Spawn Heartbeat Sender
     spawner.spawn(send_heartbeat_task(tx)).unwrap();
 
+    let mut fd = FireDetector::default();
+    let fc: FireControl<LAUNCHERS> = FireControl::default();
+
+    // Spawn Fire Control Task
+    spawner.spawn(fire_control_task(fc)).unwrap();
+
     info!("Receiving RC data...");
     loop {
         let raw = read_v2_raw_message_async::<MavMessage>(&mut rx)
@@ -133,7 +144,9 @@ async fn main(spawner: Spawner) {
             RC_CHANNELS_DATA::ID => {
                 // Send to a State machine
                 let rc = RC_CHANNELS_DATA::deser(MavlinkVersion::V2, raw.payload()).unwrap();
-                info!("RC9: {}", rc.chan9_raw);
+                if fd.tick(rc) {
+                    FIRE_CHANNEL.send(true).await;
+                }
             }
             _ => info!("Message id: {}", raw.message_id()),
         }
@@ -165,6 +178,15 @@ async fn heartbeat_watchdog_task() {
             }
         }
         Timer::after_secs(HB_WATCHDOG_INTERVAL).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn fire_control_task(mut fc: FireControl<LAUNCHERS>) {
+    info!("Start fire control task");
+    loop {
+        FIRE_CHANNEL.receive().await;
+        fc.fire().await;
     }
 }
 
