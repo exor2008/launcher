@@ -5,27 +5,40 @@ use defmt::info;
 use embassy_time::Timer;
 use mavlink::ardupilotmega::RC_CHANNELS_DATA;
 
-const FIRE_COUNTER: u8 = 5;
+const FIRE_COUNTER: u8 = 3;
 const BURN_TIME: u64 = 1000; // ms
-const COOLDOWN: u64 = 1000; // ms
 
 #[derive(Default)]
 pub struct FireDetector {
     counter: u8,
-    last_fire: usize,
+    fired: bool,
 }
 
 impl FireDetector {
     pub fn tick(&mut self, rc: RC_CHANNELS_DATA) -> bool {
-        if rc.chan12_raw >= 1500 && rc.chan9_raw >= 1200 && rc.chan9_raw < 1600 {
-            self.counter += 1;
-        }
+        match self.fired {
+            true => {
+                if rc.chan12_raw < 1500 {
+                    self.fired = false;
+                    self.counter = 0;
+                }
+                false
+            }
+            false => {
+                if rc.chan12_raw >= 1500 && rc.chan9_raw >= 1200 && rc.chan9_raw < 1600 {
+                    self.counter += 1;
+                } else {
+                    self.counter = 0;
+                }
 
-        if self.counter >= FIRE_COUNTER {
-            self.counter = 0;
-            true
-        } else {
-            false
+                if self.counter >= FIRE_COUNTER {
+                    self.counter = 0;
+                    self.fired = true;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 }
